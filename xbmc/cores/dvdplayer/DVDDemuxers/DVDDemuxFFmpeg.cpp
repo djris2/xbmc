@@ -722,15 +722,29 @@ DemuxPacket* CDVDDemuxFFmpeg::Read()
       AVStream *stream = m_pFormatContext->streams[m_pkt.pkt.stream_index];
 
       AVStream *st = m_pFormatContext->streams[m_pkt.pkt.stream_index];
+      // Fast udp/mpegts startup and channel switching.
+      // Set streaminfo false and skip avformat_find_stream_info (slow)
+      // But we need a proper codec extradata so fill it in for ffmpeg.
+      // This routine is taken from avformat_find_stream_info and friends.
       if(st->parser && st->parser->parser->split && !st->codec->extradata)
       {
-        int i= st->parser->parser->split(st->codec, m_pkt.pkt.data, m_pkt.pkt.size);
-        if (i > 0 && i < FF_MAX_EXTRADATA_SIZE)
+        int i = st->parser->parser->split(st->codec, m_pkt.pkt.data, m_pkt.pkt.size);
+        if (i == 0)
         {
+          CLog::Log(LOGNOTICE, "CDVDDemuxFFmpeg::Read() st->parser->parser->split, no extradata");
+          pPacket = CDVDDemuxUtils::AllocateDemuxPacket(0);
+        }
+        else if (i > 0 && i < FF_MAX_EXTRADATA_SIZE)
+        {
+          // Found extradata, fill it in, this will cause
+          // a new stream to be created and used. Watch out in
+          // codecs as there will be a double open, the 1st time,
+          // hints will be bogus, the 2nd time is the new stream.
           st->codec->extradata_size= i;
           st->codec->extradata= (uint8_t*)m_dllAvUtil.av_malloc(st->codec->extradata_size + FF_INPUT_BUFFER_PADDING_SIZE);
           if (st->codec->extradata)
           {
+            CLog::Log(LOGNOTICE, "CDVDDemuxFFmpeg::Read() fetching extradata, extradata_size(%d)", st->codec->extradata_size);
             memcpy(st->codec->extradata, m_pkt.pkt.data, st->codec->extradata_size);
             memset(st->codec->extradata + i, 0, FF_INPUT_BUFFER_PADDING_SIZE);
 
@@ -741,20 +755,39 @@ DemuxPacket* CDVDDemuxFFmpeg::Read()
               codec = st->codec->codec ? st->codec->codec : m_dllAvCodec.avcodec_find_decoder(st->codec->codec_id);
               m_dllAvUtil.av_dict_set(&thread_opt, "threads", "1", 0);
               m_dllAvCodec.avcodec_open2(st->codec, codec, &thread_opt);
-//            m_dllAvUtil.av_dict_free(&thread_opt);
 
+              // we don't need to actually decode here
+              st->codec->skip_idct = AVDISCARD_ALL;
+              st->codec->skip_frame = AVDISCARD_ALL;
+              st->codec->skip_loop_filter = AVDISCARD_ALL;
+
+              // This seems suspect, we assume that the key_frame
+              // will be contained in this ffmpeg pkt of demux data,
+              // seems we should fetch and decode until we hit a key_frame.
+              // Yet if we comment it out, this game stops working...
               AVFrame picture;
-              int got_picture;
               memset(&picture, 0, sizeof(AVFrame));
               picture.pts = picture.pkt_dts = picture.pkt_pts = picture.best_effort_timestamp = AV_NOPTS_VALUE;
               picture.pkt_pos = -1;
               picture.key_frame= 1;
-//              picture.sample_aspect_ratio = (AVRational){0, 1};
               picture.format = -1;
-              m_dllAvCodec.avcodec_decode_video2(st->codec, &picture,
-                                               &got_picture, &m_pkt.pkt);
+
+              int rtn, got_picture = 0;
+              rtn = m_dllAvCodec.avcodec_decode_video2(st->codec, &picture, &got_picture, &m_pkt.pkt);
               m_dllAvCodec.avcodec_close(st->codec);
+              m_dllAvUtil.av_dict_free(&thread_opt);
+
               st->parser->flags = 0;
+              int has_codec_parameters = st->codec->width && st->codec->pix_fmt != PIX_FMT_NONE;
+              CLog::Log(LOGNOTICE, "CDVDDemuxFFmpeg::Read() "
+                "rtn(%d), got_picture(%d), has_codec_parameters(%d)",
+                  rtn, got_picture, has_codec_parameters);
+
+              if (!has_codec_parameters)
+              {
+                pPacket = CDVDDemuxUtils::AllocateDemuxPacket(0);
+                return pPacket;
+              }
             }
           }
         }
